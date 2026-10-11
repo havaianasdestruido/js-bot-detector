@@ -3,10 +3,20 @@
  */
 
 import { Signal } from '../../core/Signal.js';
+import { getUserAgent, isMobileUA } from '../../core/env.js';
 
 /**
  * Detects inconsistencies in navigator properties.
  * Bots often have mismatched or spoofed navigator values.
+ *
+ * False-positive notes:
+ *  - Windows touch laptops and touchscreen all-in-ones report
+ *    `navigator.maxTouchPoints` of 10 while sending a perfectly normal desktop
+ *    user agent, so "desktop with many touch points" is not evidence of
+ *    automation. Only a *mobile* UA that claims zero touch support is
+ *    interesting, because that combination cannot come from a real device.
+ *  - Chrome 110+ user-agent reduction returns '' for `navigator.platform` on
+ *    Android, which is normal behaviour rather than an anomaly.
  */
 class NavigatorAnomalySignal extends Signal {
   static id = 'navigator-anomaly';
@@ -19,8 +29,9 @@ class NavigatorAnomalySignal extends Signal {
     let totalScore = 0;
     let checksPerformed = 0;
 
-    const ua = navigator.userAgent || '';
+    const ua = getUserAgent();
     const platform = navigator.platform || '';
+    const isMobile = isMobileUA(ua);
 
     // Platform vs UserAgent consistency check
     checksPerformed++;
@@ -38,7 +49,7 @@ class NavigatorAnomalySignal extends Signal {
     // Check for empty or suspicious platform.
     checksPerformed++;
     const isModernChrome = ua.includes('Chrome') && !ua.includes('Chromium');
-    if (!isModernChrome && (!platform || platform === '' || platform === 'undefined')) {
+    if (!isModernChrome && !isMobile && (!platform || platform === '' || platform === 'undefined')) {
       anomalies.push('empty-platform');
       totalScore += 1;
     }
@@ -60,7 +71,7 @@ class NavigatorAnomalySignal extends Signal {
     } else if (ua.includes('Firefox') && navigator.vendor !== '') {
       anomalies.push('vendor-mismatch-firefox');
       totalScore += 0.5;
-    } else if (ua.includes('Safari') && !ua.includes('Chrome') && 
+    } else if (ua.includes('Safari') && !ua.includes('Chrome') &&
                navigator.vendor !== 'Apple Computer, Inc.') {
       anomalies.push('vendor-mismatch-safari');
       totalScore += 0.5;
@@ -84,15 +95,15 @@ class NavigatorAnomalySignal extends Signal {
       }
     }
 
-    // Check maxTouchPoints consistency
+    // Check maxTouchPoints consistency.
+    // Desktop machines with touchscreens (very common on Windows) report up to
+    // 10 touch points, so a high count is normal there. A *mobile* user agent
+    // with no touch support, however, cannot come from a real device.
     checksPerformed++;
-    const isMobileUA = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
     const hasTouchPoints = navigator.maxTouchPoints > 0;
-    
-    // Desktop claiming touch or mobile with no touch
-    if (!isMobileUA && navigator.maxTouchPoints > 5) {
-      anomalies.push('desktop-high-touch-points');
-      totalScore += 0.3;
+    if (isMobile && !hasTouchPoints) {
+      anomalies.push('mobile-ua-without-touch');
+      totalScore += 0.5;
     }
 
     // Check for overridden properties (common in spoofing)

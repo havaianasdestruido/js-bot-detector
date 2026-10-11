@@ -7,6 +7,25 @@ import { Signal } from '../../core/Signal.js';
 /**
  * Tracks and analyzes scroll behavior patterns.
  * Detects programmatic scrolling and non-human scroll patterns.
+ *
+ * False-positive notes — scroll events are delivered once per animation frame,
+ * not once per unit of user input, which invalidates several of the original
+ * heuristics:
+ *  - `robotic-scroll-timing` measured the variance of the interval between
+ *    scroll events. Because those events are frame-quantized, the interval is
+ *    ~16.6ms with near-zero jitter for every user of every browser, so this
+ *    fired on essentially anyone who scrolled. Removed.
+ *  - `no-scroll-momentum` required the scroll velocity to decay. Discrete
+ *    mouse-wheel scrolling advances in fixed steps and therefore has no
+ *    deceleration phase at all. Removed.
+ *  - `exact-position-scrolls` tested `Math.round(scrollY)` against a list of
+ *    round numbers. Any user scrolling past 300px passes through 100, 200, 300
+ *    and triggers it. Removing the check entirely rather than narrowing it to
+ *    the resting position: a mouse wheel advances in 100px notches, so a real
+ *    user who stops scrolling comes to rest on a multiple of 100 too.
+ *  - A single trackpad flick legitimately moves several hundred pixels in one
+ *    frame, so the "instant jump" threshold is now relative to the viewport
+ *    and requires a sub-frame time delta.
  */
 class ScrollBehaviorSignal extends Signal {
   static id = 'scroll-behavior';
@@ -28,10 +47,10 @@ class ScrollBehaviorSignal extends Signal {
    */
   startTracking() {
     if (this._isTracking) return;
-    
+
     this._scrollEvents = [];
     this._isTracking = true;
-    
+
     this._boundHandler = () => {
       this._scrollEvents.push({
         scrollY: window.scrollY,
@@ -39,7 +58,7 @@ class ScrollBehaviorSignal extends Signal {
         t: performance.now(),
       });
     };
-    
+
     window.addEventListener('scroll', this._boundHandler, { passive: true });
   }
 
@@ -48,7 +67,7 @@ class ScrollBehaviorSignal extends Signal {
    */
   stopTracking() {
     if (!this._isTracking) return;
-    
+
     this._isTracking = false;
     if (this._boundHandler) {
       window.removeEventListener('scroll', this._boundHandler);
@@ -79,43 +98,29 @@ class ScrollBehaviorSignal extends Signal {
 
     const analysis = this._analyzeScrollPatterns(events);
 
-    // Check for instant jumps (scrollTo without animation)
+    // Check for instant jumps (scrollTo without animation).
+    // A trackpad flick covers hundreds of pixels in a single frame, so this
+    // only counts a large displacement inside a sub-frame time delta.
     if (analysis.instantJumps > 0) {
       anomalies.push('instant-scroll-jumps');
       confidence = Math.max(confidence, 0.7);
     }
 
-    // Check for perfectly consistent scroll speed
-    if (analysis.velocityVariance < 0.1 && events.length > 10) {
+    // Check for perfectly consistent scroll speed. Judged relative to the
+    // average speed: constant *velocity* over many consecutive frames means
+    // the page is being scrolled by a timer, not by a hand.
+    if (analysis.velocityCV < 0.01 && events.length > 15) {
       anomalies.push('constant-scroll-velocity');
       confidence = Math.max(confidence, 0.6);
-    }
-
-    // Check for no momentum (instant stops)
-    if (analysis.momentumEvents === 0 && events.length > 5) {
-      anomalies.push('no-scroll-momentum');
-      confidence = Math.max(confidence, 0.5);
-    }
-
-    // Check for perfectly even scroll intervals
-    if (analysis.intervalVariance < 5 && events.length > 10) {
-      anomalies.push('robotic-scroll-timing');
-      confidence = Math.max(confidence, 0.7);
     }
 
     // Check for exclusively vertical or horizontal scroll
     if (analysis.scrollDirections === 1 && Math.abs(analysis.totalScrollY) > 1000) {
       // Could be normal, but combined with other factors is suspicious
-      if (analysis.velocityVariance < 1) {
+      if (analysis.velocityCV < 0.01) {
         anomalies.push('one-dimensional-scroll');
         confidence = Math.max(confidence, 0.4);
       }
-    }
-
-    // Check for scroll-to-element patterns (exact positions)
-    if (analysis.exactPositionScrolls > 2) {
-      anomalies.push('exact-position-scrolls');
-      confidence = Math.max(confidence, 0.6);
     }
 
     const triggered = anomalies.length > 0;
@@ -137,6 +142,7 @@ class ScrollBehaviorSignal extends Signal {
       return {
         instantJumps: 0,
         velocityVariance: 0,
+        velocityCV: 0,
         momentumEvents: 0,
         intervalVariance: 0,
         scrollDirections: 0,
@@ -156,55 +162,62 @@ class ScrollBehaviorSignal extends Signal {
     // Common scroll targets (element heights, percentages)
     const commonPositions = [0, 100, 200, 300, 400, 500, 600, 800, 1000];
 
+    // One frame at 60Hz. A displacement this large inside a fraction of a frame
+    // cannot come from a wheel or a trackpad.
+    const viewportHeight = Math.max(1, window.innerHeight || 0);
+    const jumpDistance = Math.max(300, viewportHeight * 0.6);
+
     for (let i = 1; i < events.length; i++) {
       const prev = events[i - 1];
       const curr = events[i];
-      
+
       const dy = curr.scrollY - prev.scrollY;
       const dx = curr.scrollX - prev.scrollX;
       const dt = curr.t - prev.t;
-      
+
       intervals.push(dt);
 
       if (Math.abs(dy) > 0) hasVertical = true;
       if (Math.abs(dx) > 0) hasHorizontal = true;
 
-      if (dt === 0) continue;
+      if (!(dt > 0)) continue;
 
       const velocity = Math.sqrt(dy * dy + dx * dx) / dt;
       velocities.push(velocity);
 
-      // Instant jump: large distance in very short time (< 16ms, one frame)
+      // Instant jump: large distance in a sub-frame time delta
       const distance = Math.abs(dy) + Math.abs(dx);
-      if (distance > 200 && dt < 20) {
+      if (distance > jumpDistance && dt < 5) {
         instantJumps++;
       }
 
       // Momentum: decreasing velocity (natural scroll deceleration)
-      if (i > 1 && velocities.length > 1) {
+      if (velocities.length > 1) {
         const prevVelocity = velocities[velocities.length - 2];
         if (velocity < prevVelocity * 0.9 && velocity > 0) {
           momentumEvents++;
         }
       }
 
-      // Check for exact positions
+      // Passing *through* a round offset is normal; only tracked for
+      // diagnostics now, never used as evidence on its own.
       if (commonPositions.includes(Math.round(curr.scrollY))) {
         exactPositionScrolls++;
       }
     }
 
     // Calculate velocity variance
-    const avgVelocity = velocities.length > 0 
-      ? velocities.reduce((a, b) => a + b, 0) / velocities.length 
+    const avgVelocity = velocities.length > 0
+      ? velocities.reduce((a, b) => a + b, 0) / velocities.length
       : 0;
     const velocityVariance = velocities.length > 0
       ? velocities.reduce((acc, v) => acc + Math.pow(v - avgVelocity, 2), 0) / velocities.length
       : 0;
+    const velocityCV = avgVelocity > 0 ? Math.sqrt(velocityVariance) / avgVelocity : 0;
 
     // Calculate interval variance
     const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    const intervalVariance = intervals.reduce((acc, t) => 
+    const intervalVariance = intervals.reduce((acc, t) =>
       acc + Math.pow(t - avgInterval, 2), 0) / intervals.length;
 
     // Count scroll directions
@@ -213,11 +226,13 @@ class ScrollBehaviorSignal extends Signal {
     if (hasHorizontal) scrollDirections++;
 
     // Total scroll distance
-    const totalScrollY = events[events.length - 1].scrollY - events[0].scrollY;
+    const last = events[events.length - 1];
+    const totalScrollY = last.scrollY - events[0].scrollY;
 
     return {
       instantJumps,
       velocityVariance,
+      velocityCV,
       momentumEvents,
       intervalVariance,
       scrollDirections,

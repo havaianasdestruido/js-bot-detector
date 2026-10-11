@@ -7,6 +7,19 @@ import { Signal } from '../../core/Signal.js';
 /**
  * Detects WebGL anomalies and spoofed renderer information.
  * Bots often have missing, disabled, or fake WebGL contexts.
+ *
+ * False-positive notes:
+ *  - `WEBGL_debug_renderer_info` has been removed from Chrome and Firefox. When
+ *    the extension itself is unavailable there is simply nothing to read, and
+ *    treating the resulting empty renderer string as "headless" flagged every
+ *    up-to-date browser. The check now only fires when the extension is
+ *    present but returns nothing.
+ *  - "Mesa" is the standard OpenGL implementation on Linux, reported by
+ *    ordinary Intel/AMD desktops. Only software rasterisers (llvmpipe,
+ *    softpipe, swrast, SwiftShader) are suspicious.
+ *  - Missing WebGL is a weak indicator: real users disable hardware
+ *    acceleration, run with a blocklisted GPU, or use privacy extensions that
+ *    block canvas/WebGL.
  */
 class WebGLSignal extends Signal {
   static id = 'webgl';
@@ -30,35 +43,43 @@ class WebGLSignal extends Signal {
     }
 
     if (!gl) {
-      // WebGL not available - could be disabled or blocked
+      // WebGL not available - could be disabled or blocked, which real users
+      // do deliberately, so this stays weak evidence.
       anomalies.push('webgl-unavailable');
-      confidence = Math.max(confidence, 0.4);
+      confidence = Math.max(confidence, 0.3);
       return this.createResult(true, { anomalies }, confidence);
     }
 
-    // Get renderer info
+    // Get renderer info. The debug extension has been removed from current
+    // Chrome and Firefox, so its absence is expected and says nothing.
     const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
     let vendor = '';
     let renderer = '';
+    let rendererInfoAvailable = Boolean(debugInfo);
 
     if (debugInfo) {
-      vendor = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) || '';
-      renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || '';
+      try {
+        vendor = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) || '';
+        renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || '';
+      } catch (e) {
+        rendererInfoAvailable = false;
+      }
     }
 
-    // Check for empty renderer info (common in headless)
-    if (!vendor && !renderer) {
+    // Check for empty renderer info — only when the browser claims to expose it
+    if (rendererInfoAvailable && !vendor && !renderer) {
       anomalies.push('no-webgl-renderer-info');
       confidence = Math.max(confidence, 0.6);
     }
 
-    // Check for known headless/virtual renderer strings
+    // Check for known software/virtual renderers. "mesa" alone is deliberately
+    // absent: it is the normal Linux GL stack for real hardware.
     const suspiciousRenderers = [
       'swiftshader',
       'llvmpipe',
+      'softpipe',
+      'swrast',
       'software',
-      'mesa',
-      'google swiftshader',
       'vmware',
       'virtualbox',
     ];
@@ -80,7 +101,7 @@ class WebGLSignal extends Signal {
         confidence = Math.max(confidence, 0.6);
       }
       // AMD renderer should have AMD/ATI vendor
-      if ((rendererLower.includes('amd') || rendererLower.includes('radeon')) && 
+      if ((rendererLower.includes('amd') || rendererLower.includes('radeon')) &&
           !vendor.toLowerCase().includes('amd') && !vendor.toLowerCase().includes('ati')) {
         anomalies.push('vendor-renderer-mismatch');
         confidence = Math.max(confidence, 0.6);
@@ -89,7 +110,7 @@ class WebGLSignal extends Signal {
 
     // Check for supported extensions
     const extensions = gl.getSupportedExtensions() || [];
-    
+
     // Suspiciously few extensions
     if (extensions.length < 5) {
       anomalies.push('few-webgl-extensions');
@@ -111,10 +132,10 @@ class WebGLSignal extends Signal {
       // Simple render test
       gl.clearColor(0.0, 0.0, 0.0, 1.0);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      
+
       const pixels = new Uint8Array(4);
       gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-      
+
       // If clear didn't work, something's wrong
       if (pixels[3] !== 255) {
         anomalies.push('webgl-render-failure');

@@ -7,6 +7,16 @@ import { Signal } from '../../core/Signal.js';
 /**
  * Detects artifacts left by PhantomJS.
  * PhantomJS is an older headless browser that leaves specific traces.
+ *
+ * False-positive notes:
+ *  - Scanning `Error().stack` for the word "phantom" matched the page URL and
+ *    the URLs of the page's own scripts. A human visiting any site with
+ *    "phantom" in its path was instantly classified as a bot, while an error
+ *    thrown by this library never actually contains the framework's name.
+ *    The check has been removed for the same reason in the other automation
+ *    signals.
+ *  - `Function.prototype.toString.call(Function)` always returns the native
+ *    implementation string, so scanning it for "phantom" was dead code.
  */
 class PhantomJSSignal extends Signal {
   static id = 'phantomjs';
@@ -73,29 +83,6 @@ class PhantomJSSignal extends Signal {
     if (window.nightmare) {
       indicators.push('nightmare-global');
       confidence = Math.max(confidence, 1.0);
-    }
-
-    // Check for function sources containing PhantomJS
-    try {
-      const funcString = Function.prototype.toString.call(Function);
-      if (funcString.includes('phantom') || funcString.includes('Phantom')) {
-        indicators.push('function-prototype-phantom');
-        confidence = Math.max(confidence, 0.8);
-      }
-    } catch (e) {
-      // Ignore errors
-    }
-
-    // Check for PhantomJS-specific behaviors
-    // PhantomJS has a specific way of handling errors
-    try {
-      throw new Error('test');
-    } catch (e) {
-      const stack = e.stack || '';
-      if (stack.includes('phantom')) {
-        indicators.push('stack-trace-phantom');
-        confidence = Math.max(confidence, 0.9);
-      }
     }
 
     // Check for PhantomJS-specific plugin handling

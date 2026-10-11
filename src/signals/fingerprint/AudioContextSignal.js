@@ -7,6 +7,17 @@ import { Signal } from '../../core/Signal.js';
 /**
  * Checks for AudioContext anomalies.
  * Bots and headless browsers often have unusual or missing audio capabilities.
+ *
+ * False-positive notes:
+ *  - The sample rate follows whatever output device the user has selected. A
+ *    Bluetooth headset commonly reports 16000, 24000 or 32000 Hz, so anything
+ *    outside 44100/48000/96000 used to flag real users wearing headphones.
+ *    Only a non-numeric or zero rate is suspicious now.
+ *  - A mono destination is the expected result of the OS-level "play stereo
+ *    audio as mono" accessibility setting, not evidence of automation, so that
+ *    check has been removed.
+ *  - A missing AudioContext is weak evidence: privacy extensions and locked-down
+ *    enterprise browsers remove it from real users too.
  */
 class AudioContextSignal extends Signal {
   static id = 'audio-context';
@@ -20,11 +31,11 @@ class AudioContextSignal extends Signal {
 
     // Check if AudioContext exists
     const AudioContext = window.AudioContext || window.webkitAudioContext;
-    
+
     if (!AudioContext) {
       // AudioContext not available
       anomalies.push('audio-context-unavailable');
-      confidence = Math.max(confidence, 0.4);
+      confidence = Math.max(confidence, 0.3);
       return this.createResult(true, { anomalies }, confidence);
     }
 
@@ -34,43 +45,29 @@ class AudioContextSignal extends Signal {
 
     try {
       audioContext = new AudioContext();
-      
-      // Check sample rate - unusual values may indicate virtualization
-      const sampleRate = audioContext.sampleRate;
-      if (sampleRate !== 44100 && sampleRate !== 48000 && sampleRate !== 96000) {
-        anomalies.push('unusual-sample-rate');
-        confidence = Math.max(confidence, 0.3);
-      }
 
-      // Check for suspended state (auto-play policy)
-      // This is normal, but combined with other factors can be suspicious
+      // Check sample rate. The rate mirrors the user's output device (a
+      // Bluetooth headset reports 16/24/32kHz), so only an impossible value is
+      // worth reporting.
+      const sampleRate = audioContext.sampleRate;
+      if (typeof sampleRate !== 'number' || !(sampleRate > 0)) {
+        anomalies.push('invalid-sample-rate');
+        confidence = Math.max(confidence, 0.4);
+      }
 
       // Try to create an oscillator and check its properties
       oscillator = audioContext.createOscillator();
       analyser = audioContext.createAnalyser();
-      
+
       if (!oscillator || !analyser) {
         anomalies.push('audio-nodes-unavailable');
         confidence = Math.max(confidence, 0.5);
       } else {
-        // Check analyser properties
-        const fftSize = analyser.fftSize;
-        if (fftSize !== 2048) {
-          // Non-default value might indicate tampering
-          // but this alone isn't conclusive
-        }
-
         // Check destination
         const destination = audioContext.destination;
         if (!destination || destination.maxChannelCount === 0) {
           anomalies.push('no-audio-destination');
           confidence = Math.max(confidence, 0.6);
-        }
-
-        // Check for channel count
-        if (destination && destination.maxChannelCount < 2) {
-          anomalies.push('mono-audio-only');
-          confidence = Math.max(confidence, 0.3);
         }
       }
 
@@ -96,7 +93,7 @@ class AudioContextSignal extends Signal {
         if (audioContext.state === 'running') {
           const oscillatorNode = audioContext.createOscillator();
           const gainNode = audioContext.createGain();
-          const scriptProcessor = audioContext.createScriptProcessor 
+          const scriptProcessor = audioContext.createScriptProcessor
             ? audioContext.createScriptProcessor(4096, 1, 1)
             : null;
 
@@ -104,16 +101,16 @@ class AudioContextSignal extends Signal {
             oscillatorNode.type = 'triangle';
             oscillatorNode.frequency.value = 10000;
             gainNode.gain.value = 0;
-            
+
             oscillatorNode.connect(gainNode);
             gainNode.connect(scriptProcessor);
             scriptProcessor.connect(audioContext.destination);
 
             // Brief test
             oscillatorNode.start(0);
-            
+
             await new Promise(resolve => setTimeout(resolve, 50));
-            
+
             oscillatorNode.stop();
             oscillatorNode.disconnect();
             gainNode.disconnect();
@@ -145,7 +142,11 @@ class AudioContextSignal extends Signal {
         try { analyser.disconnect(); } catch (e) {}
       }
       if (audioContext) {
-        try { audioContext.close(); } catch (e) {}
+        // close() is async and rejects when the context is already closed, so
+        // the returned promise must be swallowed rather than left unhandled.
+        try {
+          Promise.resolve(audioContext.close()).catch(() => {});
+        } catch (e) {}
       }
     }
 

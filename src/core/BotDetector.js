@@ -24,6 +24,7 @@ class BotDetector {
    * @param {number} [options.humanThreshold=20] - Score threshold for human verdict
    * @param {number} [options.suspiciousThreshold=50] - Score threshold for suspicious verdict
    * @param {Array<string>} [options.instantBotSignals=[]] - Signal IDs that instantly flag as bot
+   * @param {number} [options.instantBotMinConfidence=0.9] - Confidence an instant-bot signal must carry to bypass the score
    * @param {boolean} [options.includeDefaults=true] - Include built-in signal detectors
    * @param {number} [options.detectionTimeout=5000] - Timeout for detection in ms
    */
@@ -37,6 +38,7 @@ class BotDetector {
       humanThreshold: options.humanThreshold,
       suspiciousThreshold: options.suspiciousThreshold,
       instantBotSignals: options.instantBotSignals,
+      instantBotMinConfidence: options.instantBotMinConfidence,
     });
     this._lastDetection = null;
     this._detectionTimeout = options.detectionTimeout || 5000;
@@ -175,10 +177,16 @@ class BotDetector {
         this._scoringEngine.addResult(signal.id, result, signal.weight);
       }
 
-      // Calculate score and verdict
+      // Calculate score and verdict. Confidences are handed to the verdict
+      // engine so that an instant-bot signal can only short-circuit the score
+      // when it is genuinely certain.
       const score = this._scoringEngine.calculate();
       const triggeredSignals = this._scoringEngine.getTriggeredSignals();
-      const verdict = this._verdictEngine.getVerdict(score, triggeredSignals);
+      const signalConfidences = {};
+      for (const [signalId, result] of signalResults) {
+        signalConfidences[signalId] = result.confidence;
+      }
+      const verdict = this._verdictEngine.getVerdict(score, triggeredSignals, signalConfidences);
 
       const detectionTime = performance.now() - startTime;
 

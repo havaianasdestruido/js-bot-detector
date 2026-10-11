@@ -108,6 +108,13 @@ export interface DetectorOptions {
    */
   instantBotSignals?: string[];
   /**
+   * Minimum confidence an instant-bot signal must carry before it is allowed to
+   * bypass the score and decide the verdict on its own. A signal that fired on
+   * weak evidence still contributes to the score like any other signal.
+   * @default 0.9
+   */
+  instantBotMinConfidence?: number;
+  /**
    * Whether to include mouse/keyboard/scroll behavioural signals.
    * Set to false for instant detection that does not require user interaction.
    * @default true
@@ -220,20 +227,27 @@ export declare class ScoringEngine {
 /** Converts a numeric score and triggered-signal list into a final verdict. */
 export declare class VerdictEngine {
   static readonly DEFAULT_THRESHOLDS: { human: number; suspicious: number };
+  static readonly DEFAULT_INSTANT_BOT_CONFIDENCE: number;
 
   constructor(options?: {
     humanThreshold?: number;
     suspiciousThreshold?: number;
     instantBotSignals?: string[];
+    instantBotMinConfidence?: number;
   });
 
   /**
    * Returns the verdict for the given score and triggered-signal set.
-   * Instant-bot signals take priority over the numeric score.
+   * An instant-bot signal only takes priority over the numeric score when its
+   * confidence reaches `instantBotMinConfidence`.
+   *
+   * @param signalConfidences - Optional map of signal ID to the confidence it
+   *   reported. When omitted, triggered signals are treated as fully confident.
    */
   getVerdict(
     score: number,
     triggeredSignals?: string[],
+    signalConfidences?: Record<string, number> | null,
   ): Pick<DetectionResult, 'verdict' | 'score' | 'confidence' | 'reason' | 'triggeredCount'>;
 
   isInstantBotSignal(signalId: string): boolean;
