@@ -38,12 +38,35 @@ class ScoringEngine {
    * @param {number} weight - Signal weight (0.1-1.0)
    */
   addResult(signalId, result, weight) {
-    const effectiveWeight = this.getWeight(signalId, weight);
+    const effectiveWeight = ScoringEngine._toFiniteNumber(
+      this.getWeight(signalId, weight), 0
+    );
+    const triggered = Boolean(result?.triggered);
+    // The contribution is computed from a sanitized confidence so that a
+    // malformed result can never turn the score into NaN — a NaN score fails
+    // every threshold comparison and would silently read as 'bot'.
+    const effectiveConfidence = triggered
+      ? Math.max(0, Math.min(1, ScoringEngine._toFiniteNumber(result.confidence, 1)))
+      : 0;
+
     this._results.set(signalId, {
       ...result,
+      triggered,
       weight: effectiveWeight,
-      contribution: result.triggered ? effectiveWeight * result.confidence : 0,
+      contribution: effectiveWeight * effectiveConfidence,
     });
+  }
+
+  /**
+   * Coerce a value to a finite number.
+   * @param {*} value - Value to coerce.
+   * @param {number} fallback - Value to use when coercion fails.
+   * @returns {number}
+   * @private
+   */
+  static _toFiniteNumber(value, fallback) {
+    const num = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(num) ? num : fallback;
   }
 
   /**
@@ -70,6 +93,9 @@ class ScoringEngine {
     }
 
     const score = (totalContribution / totalWeight) * this.maxScore;
+    if (!Number.isFinite(score)) {
+      return 0;
+    }
     return Math.round(score * 100) / 100; // Round to 2 decimal places
   }
 

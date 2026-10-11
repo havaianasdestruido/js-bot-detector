@@ -3,10 +3,31 @@
  */
 
 import { Signal } from '../../core/Signal.js';
+import { isMobileUA, hasTouchSupport } from '../../core/env.js';
+
+/**
+ * Keys produced by IME composition / soft keyboards. They arrive without a
+ * reliable keyup, so they are excluded from hold-time and missing-keyup
+ * analysis.
+ */
+const IME_KEYS = new Set(['Unidentified', 'Process', '']);
 
 /**
  * Analyzes keystroke timing patterns.
  * Bots often type with unnatural consistency or inhuman speeds.
+ *
+ * False-positive notes:
+ *  - Auto-repeat: holding a key (backspace, an arrow key, a game control)
+ *    produces a stream of `keydown` events with no matching `keyup`, at a
+ *    perfectly regular cadence. Those events used to be counted as real
+ *    keystrokes, which made a human holding one key look like an inhuman
+ *    typist with "missing keyups". Repeats are now ignored.
+ *  - Keyup pairing used `Array.find()` on the whole keyup list, so repeated
+ *    keys were matched against the wrong keyup and produced bogus hold times.
+ *    Downs and ups are now paired FIFO per key code.
+ *  - Soft keyboards and IMEs (Android Gboard, CJK input) legitimately emit
+ *    keydown events with no keyup and with `key === 'Unidentified'`, so the
+ *    missing-keyup check is skipped on touch devices and for composed input.
  */
 class KeyboardPatternSignal extends Signal {
   static id = 'keyboard-pattern';
@@ -30,28 +51,32 @@ class KeyboardPatternSignal extends Signal {
    */
   startTracking() {
     if (this._isTracking) return;
-    
+
     this._keystrokes = [];
     this._isTracking = true;
-    
+
     this._boundKeydownHandler = (e) => {
+      if (e.isTrusted === false) return;
       this._keystrokes.push({
         type: 'down',
         key: e.key,
         code: e.code,
+        repeat: e.repeat === true,
         t: performance.now(),
       });
     };
 
     this._boundKeyupHandler = (e) => {
+      if (e.isTrusted === false) return;
       this._keystrokes.push({
         type: 'up',
         key: e.key,
         code: e.code,
+        repeat: false,
         t: performance.now(),
       });
     };
-    
+
     document.addEventListener('keydown', this._boundKeydownHandler, { passive: true });
     document.addEventListener('keyup', this._boundKeyupHandler, { passive: true });
   }
@@ -61,7 +86,7 @@ class KeyboardPatternSignal extends Signal {
    */
   stopTracking() {
     if (!this._isTracking) return;
-    
+
     this._isTracking = false;
     if (this._boundKeydownHandler) {
       document.removeEventListener('keydown', this._boundKeydownHandler);
@@ -85,14 +110,15 @@ class KeyboardPatternSignal extends Signal {
     }
 
     const keystrokes = this._keystrokes;
-    const keydowns = keystrokes.filter(k => k.type === 'down');
+    // Auto-repeat events are the OS repeating one held key, not new keystrokes.
+    const keydowns = keystrokes.filter(k => k.type === 'down' && !k.repeat);
 
     // No keyboard activity
     if (keydowns.length < this._minKeystrokes) {
       // Not necessarily a bot - could just be no typing needed
-      return this.createResult(false, { 
+      return this.createResult(false, {
         reason: 'insufficient-data',
-        keystrokes: keydowns.length 
+        keystrokes: keydowns.length
       }, 0);
     }
 
@@ -110,8 +136,12 @@ class KeyboardPatternSignal extends Signal {
       confidence = Math.max(confidence, 0.8);
     }
 
-    // Check for missing key-up events (programmatic input)
-    if (analysis.missingKeyups > keydowns.length * 0.5) {
+    // Check for missing key-up events (programmatic input).
+    // Soft keyboards, IME composition and focus loss all swallow keyup events
+    // in real browsers, so this is only judged on devices with a physical
+    // keyboard and only for keys that report a usable identity.
+    if (analysis.missingKeyups > analysis.analysableKeydowns * 0.5 &&
+        analysis.analysableKeydowns > 5 && analysis.keyupDeliveryReliable) {
       anomalies.push('missing-keyups');
       confidence = Math.max(confidence, 0.7);
     }
@@ -149,19 +179,22 @@ class KeyboardPatternSignal extends Signal {
    * @returns {Object} Analysis results
    */
   _analyzeKeystrokes(keystrokes) {
-    const keydowns = keystrokes.filter(k => k.type === 'down');
-    const keyups = keystrokes.filter(k => k.type === 'up');
+    const keydowns = keystrokes.filter(k => k.type === 'down' && !k.repeat);
+
+    const empty = {
+      avgInterKeystrokeTime: Infinity,
+      timingVariance: Infinity,
+      missingKeyups: 0,
+      analysableKeydowns: 0,
+      keyupDeliveryReliable: false,
+      holdTimeVariance: Infinity,
+      holdTimes: [],
+      sequentialKeys: 0,
+      rhythmScore: 1,
+    };
 
     if (keydowns.length < 2) {
-      return {
-        avgInterKeystrokeTime: Infinity,
-        timingVariance: Infinity,
-        missingKeyups: 0,
-        holdTimeVariance: Infinity,
-        holdTimes: [],
-        sequentialKeys: 0,
-        rhythmScore: 1,
-      };
+      return empty;
     }
 
     // Calculate inter-keystroke times
@@ -171,34 +204,53 @@ class KeyboardPatternSignal extends Signal {
     }
 
     const avgInterKeystrokeTime = interTimes.reduce((a, b) => a + b, 0) / interTimes.length;
-    const timingVariance = interTimes.reduce((acc, t) => 
+    const timingVariance = interTimes.reduce((acc, t) =>
       acc + Math.pow(t - avgInterKeystrokeTime, 2), 0) / interTimes.length;
 
-    // Calculate hold times (time between keydown and keyup for same key)
+    // Pair each keydown with the next keyup of the same key, FIFO, so that a
+    // held or repeated key never steals another key's keyup event.
     const holdTimes = [];
-    for (const down of keydowns) {
-      const up = keyups.find(u => u.key === down.key && u.t > down.t);
-      if (up) {
-        holdTimes.push(up.t - down.t);
+    const pending = new Map();
+    for (const event of keystrokes) {
+      if (event.repeat) continue;
+      const identity = event.code || event.key || '';
+      if (event.type === 'down') {
+        const queue = pending.get(identity) || [];
+        queue.push(event.t);
+        pending.set(identity, queue);
+      } else {
+        const queue = pending.get(identity);
+        if (queue && queue.length > 0) {
+          const downTime = queue.shift();
+          if (event.t >= downTime) {
+            holdTimes.push(event.t - downTime);
+          }
+        }
       }
     }
 
-    const avgHoldTime = holdTimes.length > 0 
-      ? holdTimes.reduce((a, b) => a + b, 0) / holdTimes.length 
+    // Only keys with a real identity can be judged for keyup delivery: IME and
+    // soft-keyboard input reports 'Unidentified'/'Process' with no keyup.
+    const analysable = keydowns.filter(k => !IME_KEYS.has(k.key) && !IME_KEYS.has(k.code));
+    const keyupDeliveryReliable = !isMobileUA() && !hasTouchSupport();
+
+    const avgHoldTime = holdTimes.length > 0
+      ? holdTimes.reduce((a, b) => a + b, 0) / holdTimes.length
       : 0;
     const holdTimeVariance = holdTimes.length > 0
       ? holdTimes.reduce((acc, t) => acc + Math.pow(t - avgHoldTime, 2), 0) / holdTimes.length
       : Infinity;
 
-    // Count missing keyups
-    const missingKeyups = keydowns.length - holdTimes.length;
+    // Count missing keyups among analysable keystrokes only
+    const missingKeyups = Math.max(0, analysable.length - holdTimes.length);
 
     // Count sequential keys (chars typed in order, like 'abc' or '123')
     let sequentialKeys = 0;
     for (let i = 1; i < keydowns.length; i++) {
-      const prevCode = keydowns[i - 1].key.charCodeAt(0);
-      const currCode = keydowns[i].key.charCodeAt(0);
-      if (Math.abs(currCode - prevCode) === 1) {
+      const prevCode = (keydowns[i - 1].key || '').charCodeAt(0);
+      const currCode = (keydowns[i].key || '').charCodeAt(0);
+      if (!Number.isNaN(prevCode) && !Number.isNaN(currCode) &&
+          Math.abs(currCode - prevCode) === 1) {
         sequentialKeys++;
       }
     }
@@ -210,7 +262,9 @@ class KeyboardPatternSignal extends Signal {
       const sortedTimes = [...interTimes].sort((a, b) => a - b);
       const median = sortedTimes[Math.floor(sortedTimes.length / 2)];
       // Count how many timings deviate significantly from median
-      const deviations = interTimes.filter(t => Math.abs(t - median) > median * 0.3).length;
+      const deviations = median > 0
+        ? interTimes.filter(t => Math.abs(t - median) > median * 0.3).length
+        : 0;
       rhythmScore = deviations / interTimes.length;
     }
 
@@ -218,6 +272,8 @@ class KeyboardPatternSignal extends Signal {
       avgInterKeystrokeTime,
       timingVariance,
       missingKeyups,
+      analysableKeydowns: analysable.length,
+      keyupDeliveryReliable,
       holdTimeVariance,
       holdTimes,
       sequentialKeys,

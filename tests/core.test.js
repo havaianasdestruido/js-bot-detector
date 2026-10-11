@@ -107,6 +107,28 @@ describe('ScoringEngine', () => {
     expect(engineWithOverrides.getWeight('test', 1.0)).toBe(0.2);
   });
 
+  it('should apply weight overrides when calculating the score', () => {
+    const engineWithOverrides = new ScoringEngine({
+      weightOverrides: { 'test': 0.2 }
+    });
+    engineWithOverrides.addResult('test', { triggered: true, confidence: 1.0 }, 1.0);
+    engineWithOverrides.addResult('other', { triggered: false, confidence: 0 }, 0.8);
+
+    // contribution 0.2 over a total weight of 1.0 => 20
+    expect(engineWithOverrides.calculate()).toBe(20);
+  });
+
+  it('should never produce a NaN score from a malformed result', () => {
+    // A missing or non-numeric confidence used to poison the sum with NaN, and
+    // a NaN score fails every threshold comparison, reading as 'bot'.
+    engine.addResult('missing-confidence', { triggered: true }, 0.5);
+    engine.addResult('bad-confidence', { triggered: true, confidence: 'high' }, 0.5);
+
+    const score = engine.calculate();
+    expect(Number.isNaN(score)).toBe(false);
+    expect(score).toBe(100);
+  });
+
   it('should track triggered signals', () => {
     engine.addResult('triggered', { triggered: true, confidence: 1.0 }, 1.0);
     engine.addResult('not-triggered', { triggered: false, confidence: 0 }, 1.0);
@@ -146,6 +168,23 @@ describe('VerdictEngine', () => {
     
     const result = engineWithInstant.getVerdict(10, ['webdriver']);
     expect(result.verdict).toBe(Verdict.BOT);
+  });
+
+  it('should only let a confident instant bot signal bypass the score', () => {
+    const engineWithInstant = new VerdictEngine({
+      instantBotSignals: ['puppeteer']
+    });
+
+    // Weak corroboration contributes to the score instead of deciding alone.
+    expect(engineWithInstant.getVerdict(10, ['puppeteer'], { puppeteer: 0.3 }).verdict)
+      .toBe(Verdict.HUMAN);
+    expect(engineWithInstant.getVerdict(10, ['puppeteer'], { puppeteer: 1.0 }).verdict)
+      .toBe(Verdict.BOT);
+  });
+
+  it('should treat a non-finite score as zero rather than bot', () => {
+    expect(engine.getVerdict(NaN, []).verdict).toBe(Verdict.HUMAN);
+    expect(engine.getVerdict(undefined, []).verdict).toBe(Verdict.HUMAN);
   });
 
   it('should respect custom thresholds', () => {

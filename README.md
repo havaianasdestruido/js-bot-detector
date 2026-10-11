@@ -229,8 +229,13 @@ Base class for detection signals. Extend this to create custom signals.
     'webdriver',
     'puppeteer',
   ],
+  instantBotMinConfidence: 0.9,    // Confidence an instant-bot signal needs
 }
 ```
+
+An `instantBotSignals` entry only short-circuits the score when the signal that
+fired is actually certain about it (at least `instantBotMinConfidence`). A weak
+match still contributes to the accumulated score like every other signal.
 
 ## Security Considerations
 
@@ -265,6 +270,62 @@ npm run dev
 ```
 
 ## Changelog
+
+### v1.2.0
+
+A false-positive audit across every signal and the core engines. Each item below
+is a real, healthy browser or user that an earlier release classified as
+automated. All of them are now pinned by regression tests in
+`tests/false-positives.test.js`, which runs the detector against realistic
+browser profiles (desktop/mobile Chrome, Firefox and Safari, Linux Mesa GPUs,
+touchscreens, background tabs, zoomed and fullscreen windows, installed PWAs).
+
+**Environment**
+- `HeadlessSignal`: an empty `navigator.plugins` list is only evidence on desktop Chromium — Android Chrome and iOS Safari expose no plugin list at all. A missing Network Information API (Chromium-only) can no longer trigger the signal on its own. Zero-sized windows are only judged in a desktop window that is not fullscreen or an installed PWA.
+- `NavigatorAnomalySignal`: removed `desktop-high-touch-points`. Windows touch laptops report `maxTouchPoints` of 10 with an ordinary desktop user agent. Replaced with the combination that cannot occur on a real device: a mobile UA with zero touch points.
+- `PermissionsSignal`: unsupported permission names throw `TypeError` / `NotSupportedError` / `NotFoundError` in real browsers, and a `Permissions-Policy` header produces `NotAllowedError` — none of those are evidence any more. The `camera` probe was removed for the same reason, and a zero-sized window only corroborates a headless finding on desktop.
+
+**Fingerprint**
+- `WebGLSignal`: `WEBGL_debug_renderer_info` has been removed from Chrome and Firefox. When the extension is unavailable there is nothing to read, so `no-webgl-renderer-info` no longer fires — it was flagging every up-to-date browser. `mesa` was dropped from the software-renderer list (it is the normal Linux GL stack for real Intel/AMD hardware); `llvmpipe`, `softpipe`, `swrast` and `swiftshader` still match. Missing WebGL is now weak evidence, since users disable hardware acceleration deliberately.
+- `PluginsSignal`: an empty plugin list is only evidence on desktop Chromium; `minimal-plugins` (exactly one plugin on desktop, which is what a hardened Firefox looks like) was removed; two plugins sharing a name is no longer treated as spoofing.
+- `AudioContextSignal`: the sample rate follows the output device the user selected — a Bluetooth headset reports 16/24/32 kHz, so every rate outside 44.1/48/96 kHz was flagging people wearing headphones. Only an impossible rate counts now. Mono output is an OS accessibility setting and is no longer checked.
+- `ScreenSignal`: `outerWidth/outerHeight` and `inner === outer` are only judged in a windowed desktop browser (mobile Firefox reports 0x0, F11 and installed PWAs legitimately have no chrome). 1920x1080 was removed from the "headless default resolutions" list — it is the most common desktop resolution there is. The `devicePixelRatio` range check was removed because browser zoom owns that value (25% zoom gives 0.25, 500% on a retina display gives 10). "Window larger than screen" and "available larger than total" now require a large, unexplainable excess, since spanning two monitors is normal.
+
+**Behaviour**
+- `MouseMovementSignal`: "no mouse movement" no longer triggers. It flagged every touch-device user, every keyboard-only user, and every human who simply reads a page. Raw native samples from `PointerEvent.getCoalescedEvents()` are used when the browser provides them; when it does not, the timing check is skipped, because browsers deliver one frame-quantized event per frame and that ~16.6ms cadence looked "robotic" for everyone. A straight-line path only counts when the speed is also machine-constant, so dragging the cursor to a button is no longer suspicious.
+- `KeyboardPatternSignal`: auto-repeat events are excluded, so holding backspace or an arrow key no longer reads as inhuman speed with "missing keyups". Keydown/keyup pairing is FIFO per key code instead of `Array.find()` over the whole list, which had been producing bogus hold times. The missing-keyup check is skipped on touch devices and for IME input, both of which legitimately emit keydown with no keyup.
+- `ScrollBehaviorSignal`: removed `robotic-scroll-timing` (scroll events are frame-quantized, so the interval variance is ~0 for every user of every browser), `no-scroll-momentum` (discrete wheel scrolling has no deceleration phase) and `exact-position-scrolls` (any user scrolling past 300px passes through 100/200/300). Velocity checks are now scale-free, and the jump threshold is relative to the viewport, so a trackpad flick is not a "jump".
+- `InteractionTimingSignal`: time-to-first-interaction is measured from navigation start (`performance.now()`) instead of from the moment the signal object happened to be constructed — the old behaviour flagged the first click on any site that runs detection lazily (on submit, in a lazy chunk). Only trusted events count, so events dispatched by page scripts are ignored. Scroll events are excluded from interval and sequence analysis, and a repeated sequence now needs at least two distinct event types (typing a word used to match its own halves). The tracking window is capped at 2500ms like the other behaviour signals, so it fits inside the default 5000ms timeout instead of racing it.
+
+**Automation**
+- All four automation signals stopped scanning `Error().stack`. The stack contains the page URL and the URLs of the page's own scripts, so a human visiting pptr.dev or playwright.dev was classified as a bot outright, while an error thrown by this library never actually contains the framework's name.
+- `PlaywrightSignal`: the generic `__pw` window-key scan matched unrelated globals such as `__pwaInstalled`, and a bare `playwright` global is something pages define rather than something Playwright injects — both removed, along with the duplicate `HeadlessChrome` user-agent check.
+- `PuppeteerSignal`: the duplicate `HeadlessChrome` user-agent check was removed (that evidence belongs to `HeadlessSignal`, and counting it twice inflated every headless-looking browser), and an 800x600 viewport is now weak corroboration only — it is also a real window size.
+
+**Core**
+- `VerdictEngine`: an instant-bot signal must now carry at least `instantBotMinConfidence` (default 0.9) to bypass the score. A weak artifact match contributes to the accumulation instead of deciding the verdict on its own.
+- `ScoringEngine`: a malformed signal result (missing or non-numeric confidence or weight) can no longer produce a NaN score. NaN fails every threshold comparison, so it silently read as "bot".
+
+**Measured impact.** Bot score for real visitors, before and after. Most rows are `detectInstant()`; the last three use the full `detect()` with a simulated visitor scrolling and tapping:
+
+| Visitor | v1.1.0 | v1.2.0 |
+|---|---|---|
+| Desktop Chrome, touchscreen laptop | 0.25 | 0 |
+| Firefox on Linux with a Mesa/Intel GPU | 4.62 | 0 |
+| Safari on macOS | 6.60 | 0 |
+| Safari on iOS | 8.49 | 0 |
+| Chrome on Android | 7.36 | 0 |
+| Firefox on Android (0x0 window) | 11.13 | 0 |
+| Current Chrome without `WEBGL_debug_renderer_info` | 3.96 | 0 |
+| Link opened in a background tab | 1.51 | 0 |
+| Chrome zoomed to 33% | 1.51 | 0 |
+| Chrome with a Bluetooth headset, mono audio | 1.42 | 0 |
+| Chrome in F11 fullscreen | 1.89 | 0 |
+| Warm revisit (keep-alive connection) | 1.89 | 0 |
+| Back/forward-cache restore | 3.30 | 0 |
+| Desktop Chrome, passive reader (full detect) | 4.03 | 0 |
+| Firefox on Android, touch user (full detect) | 12.84 | 0 |
+| Safari on iOS, touch user (full detect) | 11.94 | 0 |
 
 ### v1.1.0
 - **TypeScript support:** Added first-party TypeScript declarations (`dist/types.d.ts`). All public classes, interfaces, and functions are now fully typed — `DetectionResult`, `SignalResult`, `DetectorOptions`, `DetectOptions`, and every built-in signal class.
